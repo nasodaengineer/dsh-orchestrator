@@ -155,6 +155,16 @@ function fakeCtx({
         if (typeof dispose === 'function') dispose()
       }
     },
+    // The command channel: the client's mode switch writes through it, so tests read back
+    // exactly the handler a web client would invoke.
+    injected: [],
+    inject(services, callback) {
+      const registered = []
+      const commandCtx = { commands: { register: (definition) => registered.push(definition) } }
+      ctx.injected.push({ services, callback, registered })
+      callback(commandCtx)
+      return () => {}
+    },
     on(event, handler, options) {
       handlers.set(event, handler)
       handlerOptions.set(event, options)
@@ -208,10 +218,21 @@ function fakeAgent({ id = 'agent-1', depth, header = {} } = {}) {
   const restricted = []
   const guards = []
   const registered = []
+  // One session object per agent: the dispatch mode is keyed by it, so two agents in one test
+  // are two conversations that must never share a mode.
+  const session = {
+    header,
+    log: [],
+    append(type, data) {
+      const event = { type, seq: this.log.length, time: 0, data }
+      this.log.push(event)
+      return event
+    },
+  }
   const agent = {
     id,
     options: { provider: 'p', model: 'm', ...(depth === undefined ? {} : { subagentDepth: depth }) },
-    session: { header },
+    session,
     ctx: {
       tools: {
         restrict({ deny }) {
@@ -420,7 +441,7 @@ test('the warning fires only for a resume that fell through the depth test', () 
   assert.equal(resumedChild.logs.warn.length, 0)
 })
 
-test('the switch being off still installs the guard and hands the host surface back intact', () => {
+test('the switch being off still installs the guard and hands the host surface back intact', async () => {
   // The gate is installed even while dispatch mode is off, so flipping the switch on
   // in an open conversation takes effect without a restart; the info log follows the switch.
   const { created, ctx, state, logs } = start({ enabled: false })
@@ -432,8 +453,11 @@ test('the switch being off still installs the guard and hands the host surface b
   assert.equal(logs.info.length, 0)
   assert.equal(logs.warn.length, 0)
 
-  // Turning it on filters the next request even though nothing was re-installed.
-  state.enabled = true
+  // Turning it on filters the next request even though nothing was re-installed. The mode is
+  // written through the session's own log, exactly as the client switch does.
+  const command = ctx.injected.find((entry) => entry.services.includes('commands')).registered[0]
+  const outcome = await command.handler({ agent, rawInput: 'on' })
+  assert.equal(outcome.kind, 'success')
   assert.deepEqual(namesOf(ctx.tools.definitions(agent)), mod.DEFAULT_ALLOWED_TOOLS)
   assert.deepEqual(restricted, [], 'still no restriction')
 })
@@ -830,9 +854,9 @@ test('a panel write reaches every live main agent on its next request, not by re
   assert.deepEqual(child.restricted, [])
 })
 
-test('the enable switch flips the surface in the open session through the same live read', () => {
+test('the enable switch flips the surface in the open session through the same live read', async () => {
   const main = fakeAgent()
-  const { created, ctx, handlers, state } = start({
+  const { created, ctx, handlers } = start({
     agents: { get: () => undefined, roots: () => [main.agent] },
   })
   created({ agent: main.agent, source: 'create' })
@@ -840,12 +864,13 @@ test('the enable switch flips the surface in the open session through the same l
   assert.equal(typeof volatile, 'function', 'apply must subscribe to loader/volatile-update')
   assert.deepEqual(namesOf(ctx.tools.definitions(main.agent)), mod.DEFAULT_ALLOWED_TOOLS)
 
-  state.enabled = false
+  const command = ctx.injected.find((entry) => entry.services.includes('commands')).registered[0]
+  await command.handler({ agent: main.agent, rawInput: 'off' })
   volatile()
   assert.deepEqual(namesOf(ctx.tools.definitions(main.agent)), SURFACE_TOOLS, 'off hands the host table back')
   assert.equal(main.guards[0]({ name: 'edit' }), undefined, 'and lets every call through')
 
-  state.enabled = true
+  await command.handler({ agent: main.agent, rawInput: 'on' })
   volatile()
   assert.deepEqual(namesOf(ctx.tools.definitions(main.agent)), mod.DEFAULT_ALLOWED_TOOLS)
   assert.match(main.guards[0]({ name: 'edit' }), /not available to the main agent/)
@@ -1051,10 +1076,13 @@ test('the write that empties the published catalog repairs it in the same event'
 
   // The repair is not a one-off: every write repeats the same commit.
   harness.resetCatalog()
+  const announced = harness.emitted.length
   harness.handlers.get('loader/volatile-update')()
   assert.deepEqual(harness.catalog(), ['delegate', 'read'])
-  // And the panel is told to re-read, so its rows do not stay on the empty snapshot.
-  assert.deepEqual(harness.emitted.at(-1), ['settings/document-updated', 'orchestrator', 3])
+  // The repair is quiet on purpose: the settings write that carries this event has already
+  // invalidated the client's document, so announcing the catalog again would make every open
+  // panel re-read every namespace — the second half of the one-second lag a checkbox had.
+  assert.equal(harness.emitted.length, announced, 'a repair never announces a second refresh')
 })
 
 test('the published catalog includes tools a scope registers for a root agent', async () => {
@@ -1068,3 +1096,106 @@ test('the published catalog includes tools a scope registers for a root agent', 
   })
   assert.deepEqual(harness.catalog(), ['read', 'subagent'])
 })
+
+/**
+ * Cross-session isolation. The regression this feature exists for: session A runs with
+ * dispatch mode on, session B toggles its own mode, and A's next request and tool calls must
+ * be unchanged. Every assertion below drives two real session objects through the same plugin
+ * instance, so a shared flag anywhere in the read path would fail here.
+ */
+test('two conversations keep independent dispatch modes, in both directions', async () => {
+  const a = fakeAgent({ id: 'session-a' })
+  const b = fakeAgent({ id: 'session-b' })
+  const { ctx, created } = start({ agents: { get: () => undefined, roots: () => [a.agent, b.agent] } })
+  created({ agent: a.agent, source: 'create' })
+  created({ agent: b.agent, source: 'create' })
+  const command = ctx.injected.find((entry) => entry.services.includes('commands')).registered[0]
+
+  // A is in dispatch mode, B is not. A's table is the whitelist, B's is the host's.
+  await command.handler({ agent: a.agent, rawInput: 'on' })
+  await command.handler({ agent: b.agent, rawInput: 'off' })
+  assert.deepEqual(namesOf(ctx.tools.definitions(a.agent)), mod.DEFAULT_ALLOWED_TOOLS)
+  assert.deepEqual(namesOf(ctx.tools.definitions(b.agent)), SURFACE_TOOLS)
+
+  // B turning its own mode on must not change A... (A is already on, so compare against B).
+  await command.handler({ agent: b.agent, rawInput: 'on' })
+  assert.deepEqual(namesOf(ctx.tools.definitions(a.agent)), mod.DEFAULT_ALLOWED_TOOLS)
+  assert.deepEqual(namesOf(ctx.tools.definitions(b.agent)), mod.DEFAULT_ALLOWED_TOOLS)
+
+  // ...and B turning it back off must not switch A off either.
+  await command.handler({ agent: b.agent, rawInput: 'off' })
+  assert.deepEqual(namesOf(ctx.tools.definitions(a.agent)), mod.DEFAULT_ALLOWED_TOOLS, 'A is untouched by B turning off')
+  assert.deepEqual(namesOf(ctx.tools.definitions(b.agent)), SURFACE_TOOLS, 'only B went back to the host table')
+  assert.match(a.guards[0]({ name: 'edit', agent: a.agent }), /not available to the main agent/)
+  assert.equal(b.guards[0]({ name: 'edit', agent: b.agent }), undefined, 'B lets the call through')
+
+  // The mirror direction: A going off leaves B untouched when B is on.
+  await command.handler({ agent: b.agent, rawInput: 'on' })
+  await command.handler({ agent: a.agent, rawInput: 'off' })
+  assert.deepEqual(namesOf(ctx.tools.definitions(b.agent)), mod.DEFAULT_ALLOWED_TOOLS, 'B stays on when A turns off')
+  assert.deepEqual(namesOf(ctx.tools.definitions(a.agent)), SURFACE_TOOLS)
+})
+
+test('the guard resolves the mode from the session that is executing, not the gate owner', async () => {
+  // A guard is installed per top-level agent, but a host may report the executing agent on
+  // the call. When it does, that session decides; the gate must not fall back to its owner.
+  const a = fakeAgent({ id: 'session-a' })
+  const b = fakeAgent({ id: 'session-b' })
+  const { ctx, created } = start({ agents: { get: () => undefined, roots: () => [a.agent, b.agent] } })
+  created({ agent: a.agent, source: 'create' })
+  created({ agent: b.agent, source: 'create' })
+  const command = ctx.injected.find((entry) => entry.services.includes('commands')).registered[0]
+  await command.handler({ agent: a.agent, rawInput: 'on' })
+  await command.handler({ agent: b.agent, rawInput: 'off' })
+
+  const guard = a.guards[0]
+  assert.equal(guard({ name: 'edit', agent: b.agent }), undefined, 'B is off, so B may edit')
+  assert.match(guard({ name: 'edit', agent: a.agent }), /not available to the main agent/)
+  // A call with no agent on it falls back to the gate's own conversation.
+  assert.match(guard({ name: 'edit' }), /not available to the main agent/)
+})
+
+test('a mode change is recorded in the session log, so resume can replay it', async () => {
+  const a = fakeAgent({ id: 'session-a' })
+  const { ctx, created } = start({ agents: { get: () => undefined, roots: () => [a.agent] } })
+  created({ agent: a.agent, source: 'create' })
+  const command = ctx.injected.find((entry) => entry.services.includes('commands')).registered[0]
+  await command.handler({ agent: a.agent, rawInput: 'on' })
+  await command.handler({ agent: a.agent, rawInput: 'off' })
+
+  const records = a.agent.session.log.filter((event) => event.type === 'plugin:dsh-orchestrator/dispatch-mode')
+  assert.deepEqual(records.map((event) => event.data), [{ enabled: true }, { enabled: false }])
+  // The type follows the host's plugin-record grammar, which is what makes it persistable.
+  for (const record of records) assert.match(record.type, /^plugin:[a-z0-9][a-z0-9._-]*/)
+})
+
+test('the switch with no argument flips this session, and reads only this session', async () => {
+  const a = fakeAgent({ id: 'session-a' })
+  const { ctx, created } = start({ agents: { get: () => undefined, roots: () => [a.agent] } })
+  created({ agent: a.agent, source: 'create' })
+  const command = ctx.injected.find((entry) => entry.services.includes('commands')).registered[0]
+  // The default is on, so a bare flip turns it off, and the next flip turns it back on.
+  assert.equal((await command.handler({ agent: a.agent, rawInput: '' })).kind, 'success')
+  assert.deepEqual(namesOf(ctx.tools.definitions(a.agent)), SURFACE_TOOLS)
+  await command.handler({ agent: a.agent, rawInput: '' })
+  assert.deepEqual(namesOf(ctx.tools.definitions(a.agent)), mod.DEFAULT_ALLOWED_TOOLS)
+  // A session with no agent is refused instead of writing somewhere global.
+  assert.equal((await command.handler({ agent: undefined, rawInput: 'on' })).kind, 'error')
+})
+
+test('a session that cannot record its mode still switches for the live process', async () => {
+  // A host whose session log refuses the record must not leave the switch dead: the in-memory
+  // copy keeps the live process consistent, and the failure is reported once.
+  const a = fakeAgent({ id: 'session-a' })
+  a.agent.session.append = () => {
+    throw new Error('log closed')
+  }
+  const { ctx, created, logs } = start({ agents: { get: () => undefined, roots: () => [a.agent] } })
+  created({ agent: a.agent, source: 'create' })
+  const command = ctx.injected.find((entry) => entry.services.includes('commands')).registered[0]
+  await command.handler({ agent: a.agent, rawInput: 'off' })
+  assert.deepEqual(namesOf(ctx.tools.definitions(a.agent)), SURFACE_TOOLS, 'the switch still took effect')
+  assert.equal(logs.warn.length, 1)
+  assert.match(logs.warn[0], /applies to this process only/)
+})
+

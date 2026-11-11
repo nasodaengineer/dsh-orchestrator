@@ -32,12 +32,14 @@
     }
   },
   "peerDependencies": {
+    "@deepseek-ai/dsh-session": "*",
+    "@deepseek-ai/dsh-tools": ">=0.2.2-rc.1 <0.3.0",
     "@deepseek-ai/schemastery": "*",
     "zod": "*"
   },
   "main": "lib/index.js",
   "scripts": {
-    "test": "node --test test/"
+    "test": "node --test \"test/*.test.mjs\""
   },
   "keywords": [
     "dsh",

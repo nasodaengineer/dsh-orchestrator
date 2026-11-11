@@ -340,13 +340,17 @@ test('saveRoute surfaces a rejected write and a write that did not land', async 
   assert.equal(await T.saveRoute(dropped, T.MAIN.fields, { provider: 'p', model: 'm', effort: '' }, t), 'route.saveFailed')
 })
 
-test('apply puts the toggle in the left slot and the picker in input.right', () => {
+test('apply targets each session with a complete dispatch-mode command', async () => {
   const regs = []
+  const commands = []
   const ctx = {
     effect: (fn) => fn(),
     locale: { register: () => {} },
     configForms: { get: (ns) => ({ ns }) },
-    remote: { commands: { execute: async () => ({ ok: true, value: 'x' }) }, session: { modelCatalog: async () => ({ ok: true, value: { groups: [] } }) } },
+    remote: {
+      commands: { execute: async (...args) => { commands.push(args); return { ok: true, value: 'handled' } } },
+      session: { modelCatalog: async () => ({ ok: true, value: { groups: [] } }) },
+    },
     slots: { inject: (_n, cb) => cb(), register: (opts, comp) => regs.push({ opts, comp }) },
   }
   mod.apply(ctx)
@@ -354,9 +358,16 @@ test('apply puts the toggle in the left slot and the picker in input.right', () 
     ['conversation.input.left', 'orchestrator-plan-toggle', 20],
     ['conversation.input.right', 'orchestrator-route-picker', 11],
   ])
-  const props = regs[1].opts.inject('S1')
-  assert.deepEqual([props.scopes.main.ns, props.scopes.worker.ns, props.scopes.orch.ns], ['agent-default-model', 'orchestrator', 'orchestrator'])
-  assert.equal(props.setPlan, undefined)
+  const propsA = regs[1].opts.inject('session-a')
+  const propsB = regs[1].opts.inject('session-b')
+  assert.deepEqual([propsA.scopes.main.ns, propsA.scopes.worker.ns, propsA.scopes.orch.ns], ['agent-default-model', 'orchestrator', 'orchestrator'])
+  assert.equal(propsA.setPlan, undefined)
+  await propsA.setMode(true)
+  await propsB.setMode(false)
+  assert.deepEqual(plain(commands), [
+    ['session-a', '/orchestrator-mode on', []],
+    ['session-b', '/orchestrator-mode off', []],
+  ])
   assert.deepEqual(plain(mod.inject), ['slots', 'locale', 'remote', 'remote.commands', 'remote.session', 'configForms'])
 })
 
@@ -975,11 +986,13 @@ test('the switch draws a focus ring only while focused', () => {
 /** Mount the allowed-tools column and expose the nodes the tests reach for. */
 function mountAllowed(scope) {
   const view = mount(T.AllowedToolsPanel, { scope, t })
-  const rows = () => nodes(view.tree).filter((node) => node.type === 'label')
+  // Tool rows only: a plugin header is a label too, but it carries no `data-tool`.
+  const rows = () => nodes(view.tree).filter((node) => node.type === 'label' && node.props?.['data-tool'] !== undefined)
+  const headers = () => nodes(view.tree).filter((node) => node.type === 'label' && node.props?.['data-plugin-toggle'] !== undefined)
   const search = () => nodes(view.tree).find((node) => node.props?.['data-search'] === 'allowed-tools')
   const button = () => nodes(view.tree).find((node) => node.type === 'button')
   const text = () => nodes(view.tree).map((node) => node.kids?.[0]).filter((kid) => typeof kid === 'string')
-  return { view, rows, search, button, text }
+  return { view, rows, headers, search, button, text }
 }
 
 test('the column is headed Allowed Tools and lists one checked row per shipped tool', () => {
@@ -1077,6 +1090,76 @@ test('a tool published by another plugin is listed, searchable and unchecked', a
   assert.deepEqual(plain(scope.calls[0].ops), [
     { op: 'set', path: ['allowedTools'], value: [...HOST_DEFAULT_ALLOWED_TOOLS, 'mcp__demo__ping'] },
   ])
+})
+
+test('rows are grouped by plugin, and an MCP server is its own group', () => {
+  const panel = mountAllowed(
+    fakeScope({ initial: { toolCatalog: ['mcp__demo__ping', 'mcp__demo__pong', 'ops_read_files', 'ops_bash'] } }),
+  )
+  const keys = panel.headers().map((header) => header.props['data-plugin-toggle'])
+  // Grouped by name convention, because the host publishes names only.
+  assert.equal(keys.includes('mcp:demo'), true)
+  assert.equal(keys.includes('ops'), true)
+  // An MCP group reads as the server name, not as the bare `mcp` prefix.
+  assert.equal(keys.includes('mcp'), false)
+  // Every tool appears exactly once, under its own group.
+  const rendered = panel.rows().map((row) => row.props['data-tool'])
+  assert.equal(new Set(rendered).size, rendered.length)
+  assert.equal(rendered.includes('mcp__demo__ping'), true)
+})
+
+test('checking a plugin header selects every tool in that plugin in one write', async () => {
+  const scope = fakeScope({ initial: { toolCatalog: ['mcp__demo__ping', 'mcp__demo__pong'] } })
+  const panel = mountAllowed(scope)
+  const header = panel.headers().find((entry) => entry.props['data-plugin-toggle'] === 'mcp:demo')
+  assert.equal(header.kids[0].props.checked, false)
+  await header.kids[0].props.onChange({ target: { checked: true } })
+  // One write for the whole group: both tools land in the whitelist together.
+  assert.equal(scope.calls.length, 1)
+  const value = plain(scope.calls[0].ops[0].value)
+  assert.deepEqual(value.filter((name) => name.startsWith('mcp__demo__')), ['mcp__demo__ping', 'mcp__demo__pong'])
+})
+
+test('unchecking a plugin header clears every tool in that plugin in one write', async () => {
+  const scope = fakeScope({
+    initial: { allowedTools: [...HOST_DEFAULT_ALLOWED_TOOLS, 'mcp__demo__ping', 'mcp__demo__pong'] },
+  })
+  const panel = mountAllowed(scope)
+  const header = panel.headers().find((entry) => entry.props['data-plugin-toggle'] === 'mcp:demo')
+  assert.equal(header.kids[0].props.checked, true)
+  await header.kids[0].props.onChange({ target: { checked: false } })
+  assert.equal(scope.calls.length, 1)
+  // Unchecking the whole group leaves exactly the shipped default, stored as `unset`.
+  assert.deepEqual(plain(scope.calls[0].ops), [{ op: 'unset', path: ['allowedTools'] }])
+  const value = plain(scope.getSnapshot().value.allowedTools ?? HOST_DEFAULT_ALLOWED_TOOLS)
+  assert.equal(value.some((name) => name.startsWith('mcp__demo__')), false)
+  // Nothing outside the group was touched.
+  for (const name of HOST_DEFAULT_ALLOWED_TOOLS) assert.equal(value.includes(name), true, name)
+})
+
+test('a partly checked plugin header reports the mixed state and its count', () => {
+  const panel = mountAllowed(
+    fakeScope({ initial: { allowedTools: [...HOST_DEFAULT_ALLOWED_TOOLS, 'mcp__demo__ping'] , toolCatalog: ['mcp__demo__ping', 'mcp__demo__pong'] } }),
+  )
+  const header = panel.headers().find((entry) => entry.props['data-plugin-toggle'] === 'mcp:demo')
+  // Mixed: the box is not checked, but its counter says how much of the group is on.
+  assert.equal(header.kids[0].props.checked, false)
+  assert.equal(header.kids[2].kids[0], '1/2')
+})
+
+test('two clicks in a row both land, so a fast user is not silently dropped', async () => {
+  const scope = fakeScope({ initial: { toolCatalog: ['read', 'edit'] } })
+  const panel = mountAllowed(scope)
+  const box = (name) => panel.rows().find((row) => row.props['data-tool'] === name).kids[0]
+  // Both writes are issued before the first resolves: the second must not be discarded.
+  await Promise.all([
+    box('read').props.onChange({ target: { checked: true } }),
+    box('edit').props.onChange({ target: { checked: true } }),
+  ])
+  assert.equal(scope.calls.length, 2)
+  const stored = scope.getSnapshot().value.allowedTools
+  assert.equal(stored.includes('read'), true, 'the first click survived')
+  assert.equal(stored.includes('edit'), true, 'the second click landed too')
 })
 
 test('unchecking a shipped name drops it from the stored whitelist', async () => {
@@ -1469,3 +1552,142 @@ test('the popover reserves the host top chrome, so its rounded top is never clip
   assert.equal(T.panelColumnStyle.gap, '8px')
 })
 
+
+// ---- Plugin grouping and the bulk header ----------------------------------------------
+
+test('a plugin group header allows every tool in the group in one write', async () => {
+  // The group owning `session_search` also owns the other session_* tools, so one click on
+  // its header is one round trip for the whole plugin instead of one per tool.
+  const scope = fakeScope({ initial: { allowedTools: [] } })
+  const panel = mountAllowed(scope)
+  const header = panel.headers().find((node) => node.props['data-plugin-toggle'] === 'session')
+  assert.notEqual(header, undefined, 'the session group has a header')
+  assert.equal(header.kids[0].type, 'input')
+  assert.equal(header.kids[0].props.type, 'checkbox')
+  assert.equal(header.kids[0].props.checked, false)
+  await header.kids[0].props.onChange({ target: { checked: true } })
+  assert.equal(scope.calls.length, 1, 'one write for the whole group')
+  const written = new Set(plain(scope.calls[0].ops)[0].value)
+  for (const name of ['session_search', 'session_trace', 'session_event_search', 'session_event_read', 'session_event_trace']) {
+    assert.equal(written.has(name), true, name + ' was added by the group')
+  }
+})
+
+test('a group header unchecks every tool it covers', async () => {
+  const scope = fakeScope()
+  const panel = mountAllowed(scope)
+  const header = () => panel.headers().find((node) => node.props['data-plugin-toggle'] === 'session')
+  assert.equal(header().kids[0].props.checked, true, 'the shipped session tools start checked')
+  await header().kids[0].props.onChange({ target: { checked: false } })
+  const written = plain(scope.calls[0].ops)[0].value
+  for (const name of ['session_search', 'session_trace', 'session_event_search', 'session_event_read', 'session_event_trace']) {
+    assert.equal(written.includes(name), false, name + ' was removed by the group')
+  }
+})
+
+test('a partly allowed group reports both counts and never claims to be complete', async () => {
+  const scope = fakeScope({ initial: { allowedTools: ['session_search'] } })
+  const panel = mountAllowed(scope)
+  const header = panel.headers().find((node) => node.props['data-plugin-toggle'] === 'session')
+  assert.equal(header.kids[0].props.checked, false, 'partial is not all')
+  // The indeterminate dash is what tells the user the group is mixed.
+  let marked = null
+  const node = {}
+  Object.defineProperty(node, 'indeterminate', {
+    set: (value) => { marked = value },
+    get: () => marked,
+  })
+  header.kids[0].props.ref(node)
+  assert.equal(marked, true)
+  const counts = header.kids[2]
+  assert.equal(counts.kids[0], '1/5')
+})
+
+test('grouping never reorders the rows or the search results', async () => {
+  // A grouped row keeps its place: the shipped order stays the published order, and an
+  // extra tool keeps its alphabetical slot, so a search reads top to bottom as before.
+  const scope = fakeScope({ initial: { toolCatalog: ['read', 'edit'] } })
+  const panel = mountAllowed(scope)
+  const all = panel.rows().map((row) => row.props['data-tool'])
+  assert.deepEqual(all.slice(0, HOST_DEFAULT_ALLOWED_TOOLS.length), HOST_DEFAULT_ALLOWED_TOOLS)
+  panel.search().props.onChange({ target: { value: 'session' } })
+  assert.deepEqual(panel.rows().map((row) => row.props['data-tool']), [
+    'session_search',
+    'session_trace',
+    'session_event_search',
+    'session_event_read',
+    'session_event_trace',
+  ])
+})
+
+test('a single-word tool never merges into a group with anything else', () => {
+  // A single-word name is not a plugin prefix, so it heads a group of exactly itself: the
+  // header can only ever toggle that one row, and it never swallows a neighbouring tool.
+  const panel = mountAllowed(fakeScope())
+  const scope = fakeScope({ initial: { allowedTools: [] } })
+  const grouped = mountAllowed(scope)
+  for (const lone of ['delegate', 'orchestrate', 'compress']) {
+    const header = grouped.headers().find((node) => node.props['data-plugin-toggle'] === lone)
+    assert.notEqual(header, undefined, lone + ' heads its own group')
+    // Exactly one tool under it: the count reads 0/1 for an empty whitelist.
+    assert.equal(header.kids[2].kids[0], '0/1', lone + ' covers only itself')
+  }
+  // A real multi-tool plugin is still grouped under its prefix.
+  const session = panel.headers().find((node) => node.props['data-plugin-toggle'] === 'session')
+  assert.equal(session.kids[2].kids[0], '5/5')
+})
+
+
+// ---- Optimistic rendering --------------------------------------------------------------
+
+test('a checkbox flips on the click, before the settings round trip answers', async () => {
+  // The reported symptom: a click took about a second to show. The write is still a full
+  // settings round trip, so the box must not wait for it; it flips immediately and the write
+  // settles behind it.
+  let release
+  const gate = new Promise((resolve) => { release = resolve })
+  const scope = fakeScope()
+  const mutate = scope.mutate
+  scope.mutate = async (ops, expected) => {
+    await gate
+    return mutate(ops, expected)
+  }
+  const panel = mountAllowed(scope)
+  const row = () => panel.rows().find((entry) => entry.props['data-tool'] === 'compress')
+  assert.equal(row().kids[0].props.checked, true)
+  const settled = row().kids[0].props.onChange({ target: { checked: false } })
+  // The round trip has not answered yet, and the box has already moved.
+  assert.equal(row().kids[0].props.checked, false, 'the box does not wait for the write')
+  release()
+  await settled
+  assert.equal(row().kids[0].props.checked, false, 'the stored value agrees afterwards')
+})
+
+test('a refused write puts the box back where the profile still has it', async () => {
+  // An optimistic box must never keep lying after the Host rejects the write.
+  const scope = fakeScope({ reject: 'conflict' })
+  const panel = mountAllowed(scope)
+  const row = () => panel.rows().find((entry) => entry.props['data-tool'] === 'compress')
+  await row().kids[0].props.onChange({ target: { checked: false } })
+  // The stored value never changed, so the overlay is pointless: the box shows the profile.
+  assert.equal(row().kids[0].props.checked, true, 'a rejected write is not shown as applied')
+  assert.equal(nodes(panel.view.tree).some((node) => node.props?.role === 'alert'), true)
+})
+
+test('a group header flips its rows on the click as well', async () => {
+  let release
+  const gate = new Promise((resolve) => { release = resolve })
+  const scope = fakeScope()
+  const mutate = scope.mutate
+  scope.mutate = async (ops, expected) => {
+    await gate
+    return mutate(ops, expected)
+  }
+  const panel = mountAllowed(scope)
+  const header = () => panel.headers().find((node) => node.props['data-plugin-toggle'] === 'session')
+  const settled = header().kids[0].props.onChange({ target: { checked: false } })
+  assert.equal(header().kids[0].props.checked, false, 'the group box flips immediately')
+  assert.equal(header().kids[2].kids[0], '0/5', 'and so do the rows under it')
+  release()
+  await settled
+})
