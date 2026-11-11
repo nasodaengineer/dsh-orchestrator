@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { DELEGATE_TOOL, ORCHESTRATE_TOOL } from '../lib/api.js'
+import { AGENT_ADMIN_TOOL, DELEGATE_TOOL, ORCHESTRATE_TOOL } from '../lib/api.js'
 import { OFFICIAL_SHADOW, installToolSurface } from '../lib/tool-surface.js'
 
 /**
@@ -20,6 +20,7 @@ const HOST_SURFACE = [
   'workflow',
   'delegate',
   'orchestrate',
+  'orchestrator_agents',
   'send_message',
   'todo_write',
   'compress',
@@ -120,6 +121,28 @@ test('a child is masked even when the whitelist would have allowed the pair', ()
   assert.equal(names.includes('delegate'), false)
   assert.equal(names.includes('orchestrate'), false)
   assert.equal(names.includes('send_message'), true)
+})
+
+test('a child never sees the subagent-management tool, whatever the whitelist says', () => {
+  // A worker that could list, message or interrupt its siblings would escape the planner's
+  // authority, so the deny list wins over an allow list that names it.
+  const { service } = fakeTools()
+  installToolSurface({ tools: service, allowed: [...ALLOWED, AGENT_ADMIN_TOOL] })
+  for (const agent of [childAgent, resumedChild]) {
+    const names = namesOf(service.definitions(agent))
+    assert.equal(names.includes(AGENT_ADMIN_TOOL), false, agent.id)
+  }
+  // The main agent still gets it when the panel allows it.
+  assert.equal(namesOf(service.definitions(mainAgent)).includes(AGENT_ADMIN_TOOL), true)
+})
+
+test('the admin tool is part of the default worker deny list', () => {
+  const { service } = fakeTools({ names: [...HOST_SURFACE] })
+  installToolSurface({ tools: service, allowed: ALLOWED })
+  const names = namesOf(service.definitions(childAgent))
+  for (const name of [DELEGATE_TOOL, ORCHESTRATE_TOOL, AGENT_ADMIN_TOOL]) {
+    assert.equal(names.includes(name), false, name)
+  }
 })
 
 test('the leaked official tools are shadowed while their dsh-ops replacement exists', () => {

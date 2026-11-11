@@ -72,7 +72,14 @@ test('the tool is concurrency-safe, named delegate, and takes optional route ove
     'prompt',
     'provider',
     'reasoning_effort',
+    'taskKey',
+    'writeScope',
   ])
+  // The two guard fields are optional, so an old call keeps the old behaviour exactly.
+  assert.equal('required' in tool.parameters.taskKey, false)
+  assert.equal('required' in tool.parameters.writeScope, false)
+  assert.equal(tool.parameters.writeScope.type, 'array')
+  assert.equal(tool.parameters.writeScope.items.type, 'string')
   // The author dialect spells requiredness per property, not as a `required` array.
   assert.equal(tool.parameters.prompt.required, true)
   assert.equal(tool.parameters.description.required, true)

@@ -773,11 +773,16 @@ const HOST_DEFAULT_ALLOWED_TOOLS = [...hostListBody.matchAll(/'([^']+)'/g)].map(
 
 test('the bundled copy of the shipped whitelist matches the host constant', () => {
   assert.deepEqual(plain(T.DEFAULT_ALLOWED_TOOLS), HOST_DEFAULT_ALLOWED_TOOLS)
-  assert.equal(HOST_DEFAULT_ALLOWED_TOOLS.length, 12)
+  // 11 since `orchestrator_agents` replaced the host's `send_message`/`interrupt_agent` pair.
+  assert.equal(HOST_DEFAULT_ALLOWED_TOOLS.length, 11)
   // The whitelist names the planning and delegation tools only: no file, search, shell or
   // web tool may appear here, or the main agent could work on the repo by itself.
-  for (const name of ['delegate', 'orchestrate', 'send_message', 'interrupt_agent', 'todo_write', 'ask_user_question', 'compress']) {
+  for (const name of ['delegate', 'orchestrate', 'orchestrator_agents', 'todo_write', 'ask_user_question', 'compress']) {
     assert.equal(HOST_DEFAULT_ALLOWED_TOOLS.includes(name), true, name)
+  }
+  // The per-agent host tools stay out of the shipped default: the admin tool replaces them.
+  for (const name of ['send_message', 'interrupt_agent']) {
+    assert.equal(HOST_DEFAULT_ALLOWED_TOOLS.includes(name), false, name)
   }
   for (const name of ['read', 'edit', 'write', 'bash', 'subagent', 'workflow', 'ralph', 'decompress', 'search_context']) {
     assert.equal(HOST_DEFAULT_ALLOWED_TOOLS.includes(name), false, name)

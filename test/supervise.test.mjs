@@ -160,6 +160,18 @@ test('composeNotice lists id, label, duration, turns, steps, new tools and text'
   assert.equal(text.includes('巡检：正常'), true)
 })
 
+test('the notice points at the whitelisted admin tool and never at send_message', () => {
+  const text = composeNotice([row()], { now: NOW, index: 1, max: 3 })
+  // The main agent's whitelist has no `send_message` / `interrupt_agent`; a notice that named
+  // them sent the model into a refused call it then had to recover from.
+  assert.equal(text.includes('send_message'), false)
+  assert.equal(text.includes('interrupt_agent'), false)
+  assert.match(text, /orchestrator_agents（action=send/)
+  assert.match(text, /orchestrator_agents（action=interrupt）/)
+  // `interrupt` submits a signal; it must never read as a confirmed stop.
+  assert.match(text, /不保证子代理已经停止/)
+})
+
 test('composeNotice warns about a loop and marks a child with no new activity', () => {
   const text = composeNotice([row({ repeated: 4, newEvents: 0 })], { now: NOW, index: 1, max: 3 })
   assert.equal(text.includes('检测到同一工具调用连续重复 4 次，可能原地打转'), true)
@@ -183,8 +195,10 @@ test('composeNotice keeps every child when only the summaries need shortening', 
   const rows = [row({ childId: 'c1' }), row({ childId: 'c2' })]
   for (const item of rows) item.lastText = 'z'.repeat(300)
 
-  const text = composeNotice(rows, { now: NOW, index: 1, max: 3, maxChars: 450 })
-  assert.equal(text.length <= 450, true)
+  // The budget only has to be big enough for two full child blocks plus the hint; the point
+  // of this case is that shortening the summaries keeps both children in the notice.
+  const text = composeNotice(rows, { now: NOW, index: 1, max: 3, maxChars: 600 })
+  assert.equal(text.length <= 600, true)
   assert.equal(text.includes('c1'), true)
   assert.equal(text.includes('c2'), true)
   assert.equal(text.includes('另有 1 个子代理未列出'), false)

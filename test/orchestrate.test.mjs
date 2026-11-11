@@ -9,6 +9,9 @@ import {
   readStageOutput,
   runOrchestration,
 } from '../lib/orchestrate.js'
+// The host's schema dialect is not installed here (no node_modules), so validity is checked
+// with the in-repo validator that speaks the same subset the tool's schemas are written in.
+import { assertSupportedSchema, validateJsonSchemaValue } from '../lib/schema.js'
 
 const ROUTE = { provider: 'nexus-deepseek', model: 'deepseek-v4.1-flash' }
 const cfg = (provider = ROUTE.provider, model = ROUTE.model, effort = '') => ({
@@ -20,6 +23,23 @@ const exec = (signal = new AbortController().signal) => ({ agent: { id: 'main' }
 const tool = (config = cfg(), subagents = { resolveMaxDepth: () => 3, startActivation: async () => ({}) }) =>
   createOrchestrateTool({ defineTool: (definition) => definition, subagents, config })
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/**
+ * Rewrite the host's own `{ type: 'json' }` node into an any-value node.
+ *
+ * `json` marks an opaque JSON payload and is host dialect, not part of the subset
+ * `lib/schema.js` speaks. Rewriting it (rather than deleting it) keeps the property declared
+ * for its parent's `additionalProperties: false`, and an annotation-only node accepts any
+ * value there. Every other keyword is the same dialect, so this is the real output schema
+ * under test, not a hand-written imitation of it.
+ */
+const hostDialectFree = (node) => {
+  // Arrays recurse too: `oneOf` branches live inside one.
+  if (Array.isArray(node)) return node.map(hostDialectFree)
+  if (node === null || typeof node !== 'object') return node
+  if (node.type === 'json') return {}
+  return Object.fromEntries(Object.entries(node).map(([key, child]) => [key, hostDialectFree(child)]))
+}
 
 async function waitUntil(predicate, timeoutMs = 1500) {
   const started = Date.now()
@@ -430,6 +450,141 @@ test('a worker that fails to start is isolated like any other item failure', asy
   assert.equal(result.results[2].output, 'ok')
   assert.deepEqual(result.errors, [{ index: 1, stage: 's', message: 'spawn failed' }])
   assert.equal(result.agentsStarted, 2)
+  // Every item still gets a row; the one whose worker never started reports null, not a guess.
+  assert.deepEqual(result.workers, [
+    { index: 0, subagentId: 'child-0' },
+    { index: 1, subagentId: null },
+    { index: 2, subagentId: 'child-2' },
+  ])
+  // `null` is a declared value, and it is an own property: an absent key would be a different
+  // shape, and a strict schema could not tell the two apart.
+  const schema = hostDialectFree(tool(cfg(), subagents).output.schema)
+  assert.deepEqual(validateJsonSchemaValue(schema.properties.workers, result.workers), [])
+  assert.equal(Object.hasOwn(result.workers[1], 'subagentId'), true)
+})
+
+test('each result row carries the id orchestrator_agents needs as childId', async () => {
+  const { subagents } = trackedSubagents(async () => textResult('ok'))
+  const result = await tool(cfg(), subagents).execute(
+    { items: ['a', 'b'], stages: [{ name: 's', prompt: 'p' }] },
+    exec(),
+  )
+  assert.deepEqual(result.workers, [
+    { index: 0, subagentId: 'child-1' },
+    { index: 1, subagentId: 'child-2' },
+  ])
+  // The schema must describe the same shape the payload emits, or the host rejects the result.
+  const schema = hostDialectFree(tool(cfg(), subagents).output.schema)
+  assert.deepEqual(assertSupportedSchema(schema), schema)
+  const workerSchema = schema.properties.workers.items
+  assert.deepEqual(Object.keys(workerSchema.properties).sort(), ['index', 'subagentId'])
+  assert.equal(workerSchema.additionalProperties, false)
+  // A successful row names the worker, and the declared schema accepts exactly that row.
+  for (const worker of result.workers) {
+    assert.equal(typeof worker.index, 'number')
+    assert.equal(typeof worker.subagentId, 'string')
+    assert.deepEqual(validateJsonSchemaValue(workerSchema, worker), [])
+  }
+  // The emitted result row itself validates: `subagentId` must be declared, or
+  // `additionalProperties: false` rejects the row and the host discards a successful call.
+  const rowSchema = schema.properties.results.items.oneOf.find((branch) => branch.type === 'object')
+  assert.equal(Object.hasOwn(rowSchema.properties, 'subagentId'), true, 'results.items declares subagentId')
+  assert.equal(rowSchema.additionalProperties, false)
+  for (const row of result.results) {
+    assert.deepEqual(validateJsonSchemaValue(rowSchema, row), [])
+    assert.equal(Object.hasOwn(row, 'subagentId'), true)
+    assert.equal(typeof row.subagentId, 'string')
+  }
+  // The whole payload validates against the real schema, not just the parts asserted above.
+  assert.deepEqual(validateJsonSchemaValue(schema, result), [])
+  // `results` keeps its existing fields, so an existing reader keeps working.
+  assert.deepEqual(result.results.map((row) => row.index), [0, 1])
+  assert.deepEqual(result.results.map((row) => row.stopReason), ['completed', 'completed'])
+})
+
+test('a multi-stage item reports the first stage worker it can address', async () => {
+  const { subagents } = trackedSubagents(async () => textResult('ok'))
+  const result = await tool(cfg(), subagents).execute(
+    { items: ['a'], stages: [{ name: 'first', prompt: 'p' }, { name: 'second', prompt: 'p' }] },
+    exec(),
+  )
+  assert.equal(result.workers.length, 1)
+  assert.equal(result.workers[0].subagentId, 'child-1')
+  assert.equal(result.results[0].subagentId, 'child-1')
+})
+
+test('a stage failure after the worker started still surfaces that worker id', async () => {
+  // The stage schema makes the worker's text answer unrecoverable: the item fails, but the
+  // worker ran, so its id must still reach the main agent through `workers`.
+  // `error` (not `aborted`) is the stop reason a schema stage may recover from by parsing the
+  // text; the text here is not JSON, so the item fails while the worker really did run.
+  const { subagents } = trackedSubagents(async () => ({ output: [{ type: 'text', text: 'not json' }], stopReason: 'error' }))
+  const result = await tool(cfg(), subagents).execute(
+    {
+      items: ['a'],
+      stages: [{ name: 's', prompt: 'p', schema: { type: 'object', properties: {}, additionalProperties: false } }],
+    },
+    exec(),
+  )
+  assert.equal(result.results[0], null)
+  assert.equal(result.errors.length, 1)
+  assert.deepEqual(result.workers, [{ index: 0, subagentId: 'child-1' }])
+  // A failed item is `null` in `results`, which the schema allows, and the whole payload
+  // stays valid because the workers row carries the id instead.
+  const schema = hostDialectFree(tool(cfg(), subagents).output.schema)
+  assert.deepEqual(validateJsonSchemaValue(schema.properties.results, result.results), [])
+})
+
+test('a worker whose result rejects still reports its id, with a null row', async () => {
+  // The worker started, so the main agent can still address it; the item's output stays null.
+  let starts = 0
+  const subagents = {
+    resolveMaxDepth: () => 3,
+    async startActivation() {
+      const index = starts
+      starts += 1
+      return {
+        childId: `child-${index}`,
+        result: Promise.reject(new Error('worker exited with an error')),
+        dispose: async () => {},
+      }
+    },
+  }
+  const result = await tool(cfg(), subagents).execute(
+    { items: ['a'], stages: [{ name: 's', prompt: 'p' }] },
+    exec(),
+  )
+  assert.equal(result.results[0], null)
+  assert.equal(result.errors.length, 1)
+  assert.deepEqual(result.workers, [{ index: 0, subagentId: 'child-0' }])
+})
+
+test('a worker that reports no id still yields null rather than an undefined property', async () => {
+  // A handle without `childId` is what the host leaves behind on some failures; the row must
+  // still be schema-shaped, and `undefined` would drop the key entirely.
+  const subagents = {
+    resolveMaxDepth: () => 3,
+    async startActivation() {
+      return { result: Promise.resolve(textResult('ok')), dispose: async () => {} }
+    },
+  }
+  const result = await tool(cfg(), subagents).execute(
+    { items: ['a'], stages: [{ name: 's', prompt: 'p' }] },
+    exec(),
+  )
+  assert.equal(Object.hasOwn(result.results[0], 'subagentId'), true)
+  assert.equal(result.results[0].subagentId, null)
+  assert.deepEqual(result.workers, [{ index: 0, subagentId: null }])
+  assert.equal(JSON.stringify(result).includes('"subagentId":null'), true)
+  const schema = hostDialectFree(tool(cfg(), subagents).output.schema)
+  const rowSchema = schema.properties.results.items.oneOf.find((branch) => branch.type === 'object')
+  assert.deepEqual(validateJsonSchemaValue(rowSchema, result.results[0]), [])
+})
+
+test('the tool description tells the model to address workers through the admin tool', () => {
+  const definition = tool(cfg(), { resolveMaxDepth: () => 3, startActivation: async () => ({}) })
+  assert.match(definition.description, /workers 按 index 与 results 对齐/)
+  assert.match(definition.description, /orchestrator_agents 的 childId/)
 })
 
 test('aborting stops new dispatch, clears running workers and rejects the call', async () => {
@@ -634,7 +789,8 @@ test('runOrchestration can be driven directly with a plan', async () => {
   assert.deepEqual(result, {
     kind: 'orchestration',
     agentsStarted: 1,
-    results: [{ index: 0, output: 'direct', stopReason: 'completed' }],
+    results: [{ index: 0, output: 'direct', stopReason: 'completed', subagentId: 'child-1' }],
+    workers: [{ index: 0, subagentId: 'child-1' }],
     errors: [],
   })
 })

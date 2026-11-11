@@ -325,6 +325,30 @@ test('a main agent gets the full rule and no scoped registration', () => {
   assert.equal(orchestrate.description.includes('【插件重试｜子代理 <id>】'), false)
 })
 
+test('apply registers the subagent-management tool exactly once', () => {
+  const { tools } = start()
+  const registered = tools.map((tool) => tool.name)
+  assert.deepEqual(registered, ['delegate', 'orchestrate', 'orchestrator_agents'])
+  const admin = tools.find((tool) => tool.name === 'orchestrator_agents')
+  assert.deepEqual(admin.parameters.action.enum, ['list', 'status', 'send', 'interrupt'])
+  // The name must not collide with the host tools it replaces.
+  for (const name of ['send_message', 'interrupt_agent', 'list_agents']) {
+    assert.notEqual(admin.name, name)
+  }
+})
+
+test('the delegation rule points the model at orchestrator_agents, not the host tools', () => {
+  // The failure this prevents: a model that tried `send_message`, saw it refused or
+  // shadowed, and re-dispatched the whole task instead of messaging the live child.
+  const { tools } = start()
+  const delegate = tools.find((tool) => tool.name === 'delegate')
+  assert.match(delegate.description, /用 orchestrator_agents 管理它/)
+  assert.match(delegate.description, /不要用 send_message \/ interrupt_agent 管理子代理/)
+  assert.match(delegate.description, /不要因为 send_message 失败就重派子代理/)
+  assert.match(delegate.description, /taskKey/)
+  assert.match(delegate.description, /writeScope/)
+})
+
 test('a panel write reaches the next request without a re-mask or a new registration', () => {
   const { created, ctx, state, tools } = start()
   const delegated = tools.length
@@ -362,12 +386,18 @@ test('the shipped whitelist is twelve planning tools, and every other name is re
   // The main agent keeps the delegation tools, the session read-only tools and `compress`:
   // the capabilities that make planning and review possible without touching the repo.
   const shipped = mod.DEFAULT_ALLOWED_TOOLS
-  assert.equal(shipped.length, 12)
+  // 11 since `orchestrator_agents` replaced the host's `send_message`/`interrupt_agent` pair.
+  assert.equal(shipped.length, 11)
+  // The host's own per-agent tools are no longer in the default: `orchestrator_agents` is the
+  // single supported route, and keeping both invited a target-id shadowing conflict.
+  for (const name of ['send_message', 'interrupt_agent']) {
+    assert.equal(shipped.includes(name), false, name)
+    assert.match(allowGuard(shipped)({ name }), /is not available to the main agent/, name)
+  }
   for (const name of [
     'delegate',
     'orchestrate',
-    'send_message',
-    'interrupt_agent',
+    'orchestrator_agents',
     'todo_write',
     'ask_user_question',
     'compress',

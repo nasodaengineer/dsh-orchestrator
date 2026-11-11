@@ -20,7 +20,7 @@
 - 每个 worker 默认最多通知 3 次（可配为 0 表示不限），避免对同一个卡住的 worker 反复唤醒主代理。
 - 只巡检 `delegate` 的 worker；`orchestrate` 的 worker 不巡检。
 - 定时器用 `ctx.effect` + `setInterval` 自建，不依赖 `cordis-plugin-timer`。
-- 不提供终止能力：`interrupt_agent` 仍在拒绝名单里，主代理只能通过 `send_message` 纠偏。
+- 巡检本身不提供终止能力：通知只读日志、只唤醒主代理。主代理的纠偏与终止一律走 `orchestrator_agents`——`action=send` 注入纠偏指令，`action=interrupt` 提交中断信号（该调用只表示信号已提交，不确认子代理已停止，是否停下仍需用 `status` 自行确认）。宿主的 `send_message` / `interrupt_agent` 默认不在主代理白名单里（两者按 session id 直接寻址、与 `orchestrator_agents` 重叠且有目标 id 遮蔽风险），需要时可由 profile 显式勾选放行。
 
 ## 替代方案与不选的理由
 
@@ -41,6 +41,6 @@
 - 每次通知都会唤醒主代理一次完整模型请求；默认预算 3 次/worker，可调间隔、调预算或关闭。
 - 通知只在回合边界生效：主代理忙时不会被打断，提醒会晚于到期时间到达。
 - 摘要来自会话日志，可能落后于 worker 的真实进度，也可能把“日志很长”误读成“有进展”；主代理仍需自己判断是否纠偏。
-- 巡检不改变 worker 的工具权限，也不提供终止；要停止一个 worker 仍需用户在宿主侧操作。
+- 巡检不改变 worker 的工具权限，自身也不终止任何 worker；终止要由主代理另发一次 `orchestrator_agents`（`action=interrupt`），且该调用提交信号后不保证 worker 已经停止。
 - 扫描固定 5 秒、间隔最短 10 秒，意味着巡检的时间精度在秒级；间隔改小后不需要重建定时器，下一次扫描按新间隔重算到期时间即可。
 - 本决定描述的是插件侧行为；真实宿主中的端到端表现需另行验证，本文不声称已经完成该验证。
