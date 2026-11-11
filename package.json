@@ -1,6 +1,6 @@
 {
   "name": "dsh-orchestrator",
-  "version": "0.7.3",
+  "version": "0.7.30",
   "private": true,
   "description": "Main agent that plans and delegates work; orchestrate fans out with pipelines and structured results; long-running workers are supervised by reading session logs",
   "type": "module",
